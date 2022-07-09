@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "dende_subpackage_b"
+version = "0.1.0"
+description = ""
+authors = ["Kashish <kbhatiya999@gmail.com>"]
+packages = [
+    { include = "dende" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+
+[tool.poetry.dev-dependencies]
+pytest = "^5.2"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
