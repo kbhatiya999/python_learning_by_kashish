@@ -40,7 +40,7 @@ SessionLocal = sessionmaker(autocommit=True,
 SQLALCHEMY_DATABASE_URL = URL.create(drivername='mysql', username=mysql_db['user'], password=mysql_db['pass'],
                                      database=mysql_db['db'], host=mysql_db['host'], port=mysql_db['port'])
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL, echo=False)
+engine = create_engine(SQLALCHEMY_DATABASE_URL, echo=True)
 metadata = MetaData()
 metadata.reflect(engine, only=['job_board_list', 'job_matching_score'])
 Base = automap_base(metadata=metadata)
@@ -48,7 +48,7 @@ Base.prepare()
 # Base.prepare(engine, reflect=True)
 
 
-crawler_engine = create_engine(crawler_db, echo=False)
+crawler_engine = create_engine(crawler_db, echo=True)
 crawler_metadata = MetaData()
 crawler_metadata.reflect(crawler_engine, only=['job_board_list'])
 
@@ -63,24 +63,9 @@ cols = [c.name for c in inspect(JobBoardList).c]
 
 SessionLocal.configure(binds={Base: engine, CrawlerBase: crawler_engine})
 
-_session = contextvars.ContextVar('session', default=None)
+# _session = contextvars.ContextVar('session', default=None)
 
 # ----------------------------------------------------------------------------------------------------------------------
-class DBSessionMeta(type):
-    # using this metaclass means that we can access db.session as a property at a class level,
-    # rather than db().session
-    @property
-    def session(self) -> Session:
-        """Return an instance of Session local to the current async context."""
-        # if _Session is None:
-        #     raise ValueError('No session bound to context')
-
-        session = _session.get()
-        if session is None:
-            raise ValueError('No session bound to context')
-
-        return session
-
 
 def model2dict(model):
     columns_ = model.__table__.c
@@ -203,7 +188,7 @@ class ThingTwo(object):
 
             data_for_insert.extend(
                 [
-                    JobBoardList(**{k: v for k, v in model2dict(d).items() if k in cols}, priority=priority_for_insert)
+                    JobBoardList(**{k: v for k, v in model2dict(d).items() if k in cols}, priority=priority)
                     for d in queried_data if d.apply_links not in potential_integrity_errors]
             )
         return data_for_insert
@@ -215,7 +200,11 @@ class ThingTwo(object):
 
 class RankedJobs:
     def fetch(self, session, between_left, between_right, ignore_domains, ):
-        subquery1 = session.query(JobBoardListCrawler.id, JobBoardListCrawler.domains,
+        search_keyword = '%salesforce%'
+
+        subquery1 = session.query(JobBoardListCrawler.id,
+                                  JobBoardListCrawler.domains,
+                                  JobBoardListCrawler.job_category,
                                   func.rank()
                                   .over(
                                       order_by=JobBoardListCrawler.upd_ts.desc(),
@@ -225,7 +214,7 @@ class RankedJobs:
                                   ).subquery()
 
         query = (session.query(subquery1.c.id)
-                 .filter(subquery1.c.rnk.between(between_left, between_right))
+                 .filter(subquery1.c.rnk.between(between_left, between_right), subquery1.c.job_category.like(search_keyword))
                  )
         data = query.all()
         job_ids = list(zip(*data))
@@ -238,7 +227,7 @@ def get_split_iterator(iterable, size=10_000):
         yield data
 
 
-def insert_in_batch_with_retry(data_to_be_inserted, session, retry_count=3):
+def insert_in_batch_with_retry(session, data_to_be_inserted, retry_count=3):
     global attempt
     for batch in get_split_iterator(data_to_be_inserted, size=1000):
         batch_data = list(batch)
@@ -254,14 +243,14 @@ def insert_in_batch_with_retry(data_to_be_inserted, session, retry_count=3):
             traceback.print_exc()
 
 
-def start(priority, start_rank, end_rank, size, exclude):
+def start(session: Session, priority, start_rank, end_rank, size, exclude):
     # global attempt, data_to_be_inserted
     for l, r in batch_ranks(start_rank, end_rank, size):
         try:
-            job_ids_to_fetch = get_ranked_jobs_between(l, r, exclude)
-            data_to_be_inserted = fetch_data(job_ids_to_fetch, priority)
+            job_ids_to_fetch = get_ranked_jobs_between(session, l, r, exclude)
+            data_to_be_inserted = fetch_data(session, job_ids_to_fetch, priority)
             if not data_to_be_inserted: break
-            insert_in_batch_with_retry(data_to_be_inserted)
+            insert_in_batch_with_retry(session, data_to_be_inserted)
             print(f'Completed working with rank ({l}, {r})')
         except (IntegrityError, Exception) as e:
             ei = sys.exc_info()
@@ -272,13 +261,13 @@ def start(priority, start_rank, end_rank, size, exclude):
             priority += 1
 
 
-def get_ranked_jobs_between(l, r, exclude):
+def get_ranked_jobs_between(session, l, r, exclude):
     with session.begin():
         job_ids_to_fetch = RankedJobs().fetch(session, between_left=l, between_right=r, ignore_domains=exclude)
     return job_ids_to_fetch
 
 
-def fetch_data(job_ids, priority_for_insert):
+def fetch_data(session, job_ids, priority_for_insert):
     try:
         for attempt in Retrying(stop=stop_after_attempt(5), wait=wait_fixed(1)):
             with attempt:
@@ -289,7 +278,7 @@ def fetch_data(job_ids, priority_for_insert):
     return data_to_be_inserted
 
 
-def get_next_priority():
+def get_next_priority(session: Session):
     max_priority = session.query(func.max(JobBoardList.priority)).one()[0]
     priority_for_insert = 0 if not max_priority else max_priority + 1
 
@@ -297,15 +286,15 @@ def get_next_priority():
 
 
 if __name__ == '__main__':
-    session.set(SessionLocal())
-
+    # session.set(SessionLocal())
+    session = SessionLocal()
     from_ = 1
-    to_ = 5
+    to_ = 20
     batch_ = 1
 
     # global ignore_domains, priority_for_insert
     with session.begin():
         existing_domains = ExistingDomains().fetch(session)
 
-    priority_ = get_next_priority()
-    start(priority=priority_, start_rank=from_, end_rank=to_, size=batch_, exclude=existing_domains)
+    priority_ = get_next_priority(session)
+    start(session=session, priority=priority_, start_rank=from_, end_rank=to_, size=batch_, exclude=existing_domains)
